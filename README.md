@@ -8,7 +8,55 @@ Objectif du projet : prédire le clic sur une publicité (classification binaire
 >
 > **La démonstration de ce livrable a été faite sur des données FICTIVES** générées au format Criteo (`scripts/generate_fake_sample.py`). Le vrai dataset Criteo sera utilisé pour les couches suivantes, après validation du sujet et des données par l'enseignant. Les statistiques affichées dans ce livrable (par exemple le nombre de clics) ne sont donc pas des résultats.
 
-## 1. Architecture de la couche d'ingestion
+## 1. Architecture globale du pipeline (cible)
+
+Le pipeline suit les quatre couches demandées : ingestion, stockage (voie froide), streaming (voie chaude) et restitution, avec Spark SQL, Spark Structured Streaming et Spark ML pour l'analytique. **Seule la couche d'ingestion (Kafka + producteur) est implémentée dans ce livrable** ; les autres composants sont conçus et seront ajoutés dans les livrables suivants.
+
+```mermaid
+flowchart LR
+    A[data/sample.tsv<br/>Criteo] --> B[Producteur Python]
+    B --> C[(Kafka KRaft<br/>topic ad-impressions<br/>3 partitions)]
+
+    subgraph FROIDE[Voie froide]
+      C -->|Structured Streaming<br/>archivage Parquet| D[(HDFS<br/>NameNode + 2 DataNodes<br/>réplication 2)]
+      D -->|Spark SQL| E[Indicateurs batch]
+      D -->|Spark ML| F[Entraînement<br/>3 modèles + tuning]
+      F --> G[Modèle sauvegardé<br/>PipelineModel dans HDFS]
+    end
+
+    subgraph CHAUDE[Voie chaude]
+      C -->|Structured Streaming| H[Inférence en temps réel]
+      G -.->|chargé au démarrage| H
+    end
+
+    E --> I[(PostgreSQL)]
+    H --> I
+    I --> J[Tableau de bord<br/>Streamlit, bonus]
+
+    subgraph SPARK[Cluster Spark]
+      S1[Spark master] --- S2[Worker 1]
+      S1 --- S3[Worker 2]
+    end
+```
+
+Tous les traitements Spark (archivage, indicateurs, entraînement, inférence) sont soumis au cluster Spark (1 master et 2 workers). Les jobs en streaming utilisent des checkpoints stockés dans HDFS pour permettre la reprise après arrêt.
+
+| Couche | Composant | Rôle | Image / version | État |
+|---|---|---|---|---|
+| Ingestion | `kafka` | Broker en mode KRaft (sans Zookeeper) | `apache/kafka:3.7.0` | **Implémenté** |
+| Ingestion | `kafka-init` | Crée le topic `ad-impressions` (3 partitions) | `apache/kafka:3.7.0` | **Implémenté** |
+| Ingestion | `producer` | Rejoue le fichier Criteo en événements JSON | Python 3.11, `kafka-python==2.0.2` | **Implémenté** |
+| Stockage | `namenode` | Métadonnées HDFS | Hadoop 3.3.x | Prévu |
+| Stockage | `datanode1`, `datanode2` | Blocs HDFS, réplication 2, deux volumes distincts | Hadoop 3.3.x | Prévu |
+| Traitement | `spark-master` | Ordonnanceur du cluster | Spark 3.5.x | Prévu |
+| Traitement | `spark-worker-1`, `spark-worker-2` | Exécution des jobs Spark | Spark 3.5.x | Prévu |
+| Traitement | jobs PySpark | Archivage, indicateurs, ML, inférence | PySpark | Prévu |
+| Restitution | `postgres` | Prédictions et indicateurs batch | PostgreSQL 16 | Prévu |
+| Restitution | `dashboard` | Affichage avec actualisation automatique (bonus) | Streamlit | Prévu |
+
+Les versions des composants prévus seront fixées dans le `docker-compose.yml` des livrables suivants.
+
+## 2. Détail de la couche d'ingestion (implémentée)
 
 ```
 data/sample.tsv ──► producer.py ──► Kafka (topic ad-impressions, 3 partitions) ──► consommateurs
@@ -23,7 +71,7 @@ data/sample.tsv ──► producer.py ──► Kafka (topic ad-impressions, 3 p
 | `producer` | build `./ingestion` (Python 3.11) | Rejoue le fichier TSV vers Kafka (profil `tools`) |
 | `consumer-check` | build `./ingestion` | Lit le topic pour vérifier le contenu (profil `tools`) |
 
-## 2. Données
+## 3. Données
 
 - Source : Criteo Display Advertising Challenge (Kaggle / Criteo AI Lab).
 - **Conditions d'utilisation** : dataset destiné à la recherche et à un usage **non commercial** (licence indiquée par Criteo : CC BY-NC-SA 3.0 ; à reconfirmer sur la page officielle du dataset et à citer dans le rapport). Notre usage est strictement pédagogique.
@@ -43,13 +91,13 @@ data/sample.tsv ──► producer.py ──► Kafka (topic ad-impressions, 3 p
 
 Les valeurs manquantes sont envoyées à `null`. Les champs `I*` et `label` sont des chaînes à ce stade : le typage est fait côté Spark.
 
-## 3. Prérequis
+## 4. Prérequis
 
 - Docker Desktop (ou Docker Engine) avec Docker Compose v2, ~4 Go de RAM disponibles pour cette couche. Sous Windows, Docker Desktop avec WSL2.
 - Python 3.11 (ou `py` sous Windows) pour générer le faux échantillon.
 - Pour les vraies données : le fichier `train.txt` de Criteo (non fourni dans ce dépôt).
 
-## 4. Lancement pas à pas
+## 5. Lancement pas à pas
 
 ### Linux / macOS / Git Bash / WSL
 
@@ -121,14 +169,14 @@ Depuis la machine hôte, Kafka est joignable sur `localhost:29092`.
 docker compose down        # arrête les conteneurs (les messages Kafka sont perdus : pas de volume pour cette couche)
 ```
 
-## 5. Concepts Kafka utilisés
+## 6. Concepts Kafka utilisés
 
 - **Topic** : flux nommé d'événements (`ad-impressions`), divisé en **partitions** (3) pour le parallélisme.
 - **Clé** : le producteur utilise `event_id` comme clé, ce qui répartit les messages entre les partitions.
 - **Producteurs / consommateurs multiples** : plusieurs producteurs peuvent écrire dans le même topic ; plusieurs consommateurs peuvent lire, soit en se partageant les partitions (même groupe), soit chacun l'intégralité (groupes différents). C'est ce qui permettra à Spark (archivage et inférence) de lire le même flux indépendamment.
 - **Garanties** : `acks=all` côté producteur ; un seul broker ici (facteur de réplication 1), ce qui est suffisant pour un cluster simulé.
 
-## 6. Structure du dépôt
+## 7. Structure du dépôt
 
 ```
 infra/ (à venir : HDFS, Spark)   ingestion/ (producer.py, check_topic.py, Dockerfile)
@@ -136,21 +184,14 @@ scripts/ (échantillon)           data/ (non versionné)      docs/ (rapport, co
 docker-compose.yml               .env.example               README.md
 ```
 
-## 7. Limites connues et suite
+## 8. Limites connues et suite
 
 - `event_id` et `event_time` sont simulés ; `event_time` représente l'heure du rejeu, pas celle de l'impression réelle. Pour le découpage temporel train/test, l'ordre de `event_id` fera foi.
 - Pas de persistance des données Kafka entre deux `docker compose down` (suffisant ici, l'archivage durable se fera dans HDFS).
 - Ce livrable a été validé sur données fictives ; le sujet et le dataset restent à faire valider par l'enseignant.
 - Prochaines étapes : cluster HDFS (NameNode + 2 DataNodes) et Spark (master + 2 workers), job Spark Structured Streaming Kafka → HDFS (Parquet), analyses batch, entraînement Spark ML, inférence en streaming, PostgreSQL, tableau de bord.
 
-## 8. Contributions
+## 9. Contributions
 
 - Souhaila ELMOUJIBI
 - Hajar AITLAKSSIR
-##  Architecture du Pipeline Big Data
-Le projet repose sur une architecture distribuée conteneurisée via Docker, structurée en 4 couches principales :
-1. **Couche d'Ingestion :** Publication de flux d'événements publicitaires via un script producteur Python (`ingestion/producer.py`) vers un cluster **Kafka / Zookeeper**.
-2. **Couche de Stockage (Voie froide) :** Archivage des flux utlisés dans **HDFS** (NameNode et DataNodes) sous format Parquet/CSV *(en cours)*.
-3. **Couche Streaming & Batch (Voie chaude & Analytique) :** Traitement des flux en temps réel et batch via **Apache Spark** (Master et Workers) et Spark Structured Streaming *(en cours)*.
-4. **Couche de Restitution :** Stockage des indicateurs et prédictions dans une base de données (ex: PostgreSQL)[cite: 1].
-

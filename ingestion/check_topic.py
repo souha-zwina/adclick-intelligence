@@ -14,7 +14,7 @@ from kafka import KafkaConsumer
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--bootstrap', default=os.getenv('KAFKA_BOOTSTRAP', 'kafka:9092'))
+    ap.add_argument('--bootstrap', default=os.getenv('KAFKA_BOOTSTRAP', 'localhost:9092'))
     ap.add_argument('--topic', default=os.getenv('KAFKA_TOPIC', 'ad-impressions'))
     ap.add_argument('--group', default='check-group')
     ap.add_argument('--show', type=int, default=3, help='nombre de messages à afficher')
