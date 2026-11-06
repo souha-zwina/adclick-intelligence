@@ -147,3 +147,10 @@ docker-compose.yml               .env.example               README.md
 
 - Souhaila ELMOUJIBI
 - Hajar AITLAKSSIR
+##  Architecture du Pipeline Big Data
+Le projet repose sur une architecture distribuée conteneurisée via Docker, structurée en 4 couches principales :
+1. **Couche d'Ingestion :** Publication de flux d'événements publicitaires via un script producteur Python (`ingestion/producer.py`) vers un cluster **Kafka / Zookeeper**.
+2. **Couche de Stockage (Voie froide) :** Archivage des flux utlisés dans **HDFS** (NameNode et DataNodes) sous format Parquet/CSV *(en cours)*.
+3. **Couche Streaming & Batch (Voie chaude & Analytique) :** Traitement des flux en temps réel et batch via **Apache Spark** (Master et Workers) et Spark Structured Streaming *(en cours)*.
+4. **Couche de Restitution :** Stockage des indicateurs et prédictions dans une base de données (ex: PostgreSQL)[cite: 1].
+
