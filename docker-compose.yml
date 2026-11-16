@@ -1,8 +1,17 @@
-# Couche d'ingestion : Kafka (mode KRaft, sans Zookeeper) + producteur Python.
-# Les services HDFS et Spark seront ajoutés dans la suite du projet.
+# Pipeline AdClick Intelligence
+#   Ingestion : Kafka (KRaft) + producteur Python
+#   Stockage  : HDFS (1 NameNode + 2 DataNodes, réplication 2) + Spark (1 master + 2 workers)
+#               + job Structured Streaming Kafka -> HDFS (Parquet)
+# Les couches ML, inférence en streaming et restitution seront ajoutées dans la suite du projet.
 name: adclick
 
+# Image Spark commune au master, aux workers et aux jobs (construite depuis infra/spark)
+x-spark: &spark
+  build: ./infra/spark
+  image: adclick-spark:3.5.6
+
 services:
+  # ---------------------------------------------------------------- Ingestion
   kafka:
     image: apache/kafka:3.7.0
     container_name: kafka
@@ -21,6 +30,12 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      # Les messages survivent à "docker compose down" : indispensable, car le checkpoint Spark
+      # (dans HDFS) mémorise des offsets Kafka. Sans ce volume, Kafka repartirait de zéro
+      # alors que le checkpoint pointerait encore sur d'anciens offsets.
+      - kafka-data:/var/lib/kafka/data
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
       interval: 10s
@@ -66,3 +81,163 @@ services:
       KAFKA_BOOTSTRAP: kafka:9092
       KAFKA_TOPIC: ${KAFKA_TOPIC:-ad-impressions}
     command: ["check_topic.py"]
+
+  # ---------------------------------------------------------------- Stockage : HDFS
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    hostname: namenode
+    environment:
+      CLUSTER_NAME: adclick
+    env_file: ./infra/hadoop/hadoop.env
+    ports:
+      - "9870:9870"     # interface web du NameNode : http://localhost:9870
+    volumes:
+      - namenode-data:/hadoop/dfs/name
+    healthcheck:
+      test: ["CMD-SHELL", "hdfs dfs -ls / > /dev/null 2>&1"]
+      interval: 15s
+      timeout: 20s
+      retries: 20
+      start_period: 40s
+
+  datanode1:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode1
+    hostname: datanode1
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870"
+    env_file: ./infra/hadoop/hadoop.env
+    ports:
+      - "9864:9864"
+    volumes:
+      - datanode1-data:/hadoop/dfs/data      # volume persistant distinct du DataNode 2
+    depends_on:
+      namenode:
+        condition: service_healthy
+
+  datanode2:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode2
+    hostname: datanode2
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870"
+    env_file: ./infra/hadoop/hadoop.env
+    ports:
+      - "9865:9864"
+    volumes:
+      - datanode2-data:/hadoop/dfs/data      # volume persistant distinct du DataNode 1
+    depends_on:
+      namenode:
+        condition: service_healthy
+
+  # Attend les 2 DataNodes puis crée l'arborescence HDFS, puis s'arrête
+  hdfs-init:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    restart: "no"
+    env_file: ./infra/hadoop/hadoop.env
+    environment:
+      CLUSTER_NAME: adclick
+    depends_on:
+      namenode:
+        condition: service_healthy
+      datanode1:
+        condition: service_started
+      datanode2:
+        condition: service_started
+    volumes:
+      - ./infra/hadoop/hdfs-init.sh:/init/hdfs-init.sh:ro
+    command: ["bash", "/init/hdfs-init.sh"]
+
+  # ---------------------------------------------------------------- Stockage : cluster Spark
+  spark-master:
+    <<: *spark
+    container_name: spark-master
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master",
+              "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    ports:
+      - "8080:8080"     # interface web Spark : http://localhost:8080
+
+  spark-worker-1:
+    <<: *spark
+    container_name: spark-worker-1
+    hostname: spark-worker-1
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+              "--webui-port", "8081", "spark://spark-master:7077"]
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 1g
+    ports:
+      - "8081:8081"
+    depends_on:
+      - spark-master
+
+  spark-worker-2:
+    <<: *spark
+    container_name: spark-worker-2
+    hostname: spark-worker-2
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+              "--webui-port", "8081", "spark://spark-master:7077"]
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 1g
+    ports:
+      - "8082:8081"
+    depends_on:
+      - spark-master
+
+  # Voie froide : job Structured Streaming permanent Kafka -> HDFS (Parquet)
+  archiver:
+    <<: *spark
+    container_name: archiver
+    hostname: archiver
+    entrypoint: ["/opt/submit.sh"]
+    command: ["/app/streaming/kafka_to_hdfs.py"]
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-ad-impressions}
+      HDFS_URL: hdfs://namenode:9000
+      SPARK_CORES_MAX: "1"    # l'archivage permanent ne garde qu'1 cœur sur les 4 du cluster
+    volumes:
+      - ./streaming:/app/streaming:ro
+    ports:
+      - "4040:4040"     # interface web du job : http://localhost:4040
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully    # le topic (3 partitions) doit exister
+      hdfs-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_started
+      spark-worker-1:
+        condition: service_started
+      spark-worker-2:
+        condition: service_started
+    restart: unless-stopped
+
+  # Jobs batch Spark lancés à la demande : docker compose run --rm spark-job /app/batch/indicators.py
+  spark-job:
+    <<: *spark
+    profiles: ["tools"]
+    entrypoint: ["/opt/submit.sh"]
+    environment:
+      HDFS_URL: hdfs://namenode:9000
+    volumes:
+      - ./batch:/app/batch:ro
+      - ./streaming:/app/streaming:ro
+    depends_on:
+      hdfs-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_started
+      spark-worker-1:
+        condition: service_started
+      spark-worker-2:
+        condition: service_started
+
+volumes:
+  kafka-data:
+  namenode-data:
+  datanode1-data:
+  datanode2-data:
